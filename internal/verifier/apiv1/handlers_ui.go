@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 	"vc/pkg/cache"
-	"vc/pkg/model"
 	"vc/pkg/openid4vp"
 
 	"github.com/google/uuid"
@@ -31,7 +30,7 @@ func (c *Client) UIMetadata(ctx context.Context) (*UIMetadataReply, error) {
 		SupportedWallets: c.cfg.Verifier.SupportedWallets,
 	}
 
-	for scope, constructor := range c.cfg.Common.CredentialConstructor {
+	for scope, constructor := range c.cfg.CredentialConstructor {
 		info := &UICredentialInfo{
 			Attributes: constructor.Attributes,
 		}
@@ -90,8 +89,7 @@ func (c *Client) UIInteraction(ctx context.Context, req *UIInteractionRequest) (
 		CodeChallengeMethod:      "",
 		Consent:                  false,
 		AuthenticSource:          "",
-		Identity:                 &model.Identity{},
-		Token:                    &cache.Token{},
+		// Identity and Token are nil until wallet presents credentials
 		Nonce:                    nonce,
 		EphemeralEncryptionKeyID: uuid.NewString(),
 		VerifierResponseCode:     "",
