@@ -18,6 +18,16 @@ import (
 	"vc/pkg/openid4vci"
 )
 
+// StoreVCIDocuments stores transformed credential documents in the VCI session cache.
+// This is used by external auth flows (SAML/OIDC) that are integrated into the
+// OpenID4VCI pipeline. The documents are stored keyed by the VCI session ID so they
+// can be retrieved during credential issuance (same as pid_auth flow).
+func (c *Client) StoreVCIDocuments(ctx context.Context, sessionID string, docs map[string]*model.CompleteDocument) error {
+	c.cacheService.Document.Set(ctx, sessionID, docs)
+	c.log.Debug("VCI documents stored from external auth", "session_id", sessionID, "doc_count", len(docs))
+	return nil
+}
+
 // VCICredentialOffer implements OpenID4VCI credential offer endpoint
 // https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html#name-credential-offer-endpoint
 func (c *Client) VCICredentialOffer(ctx context.Context, req *openid4vci.CredentialOfferParameters) (*openid4vci.CredentialOfferParameters, error) {
@@ -132,16 +142,22 @@ func (c *Client) VCICredential(ctx context.Context, req *openid4vci.CredentialRe
 		}
 
 	default:
-		// Auth methods from config (e.g., pid_auth): retrieve from session cache
-		// These credentials require presenting another credential for authentication
+		// Auth methods from config (e.g., pid_auth, saml, oidc): retrieve from session cache
+		// These credentials are populated during the external authentication callback
 		docs, ok := c.cacheService.Document.Get(ctx, authContext.SessionID)
-		if !ok {
+		if !ok || len(docs) == 0 {
 			c.log.Error(nil, "no documents found in cache for session", "session_id", authContext.SessionID)
 			return nil, errors.New("no documents found for session " + authContext.SessionID)
+		}
+		if len(docs) > 1 {
+			c.log.Info("multiple documents in cache for session, using first", "session_id", authContext.SessionID, "count", len(docs))
 		}
 		for _, doc := range docs {
 			document = doc
 			break
+		}
+		if document == nil || document.DocumentData == nil {
+			return nil, errors.New("cached document is empty for session " + authContext.SessionID)
 		}
 	}
 

@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
-	apiv1_issuer "vc/internal/gen/issuer/apiv1_issuer"
-	"vc/pkg/grpchelpers"
 	"vc/internal/apigw/oidcrp"
+	apiv1_issuer "vc/internal/gen/issuer/apiv1_issuer"
+	"vc/pkg/crypto"
+	"vc/pkg/grpchelpers"
+	"vc/pkg/model"
 	"vc/pkg/openid4vci"
 
 	"go.opentelemetry.io/otel/codes"
@@ -33,11 +34,15 @@ type OIDCRPCallbackRequest struct {
 
 // OIDCRPCallbackResponse represents the credential issuance response
 type OIDCRPCallbackResponse struct {
-	Status          string                 `json:"status"`
-	CredentialType  string                 `json:"credential_type"`
-	Credential      string                 `json:"credential"`
+	Status          string         `json:"status"`
+	CredentialType  string         `json:"credential_type"`
+	Credential      string         `json:"credential"`
 	CredentialOffer map[string]any `json:"credential_offer"`
-	Message         string                 `json:"message"`
+	Message         string         `json:"message"`
+
+	// VCIRedirectURL is set when the callback is part of a VCI consent flow.
+	// The httpserver should redirect the browser to this URL instead of returning JSON.
+	VCIRedirectURL string `json:"vci_redirect_url,omitempty"`
 }
 
 // OIDCRPInitiate initiates OIDC authentication flow
@@ -112,6 +117,42 @@ func (c *Client) OIDCRPCallback(ctx context.Context, req *OIDCRPCallbackRequest,
 		"claims_count", len(claims),
 		"subject", authResp.IDToken.Subject)
 
+	// VCI mode: if the OIDC session was initiated from the OpenID4VCI consent flow,
+	// store the transformed claims as a document in the VCI session cache and signal
+	// the httpserver to redirect back to the consent page.
+	if session.VCISessionID != "" {
+		c.log.Info("OIDC callback: VCI mode detected, storing document in VCI cache",
+			"vci_session_id", session.VCISessionID,
+			"credential_type", session.CredentialType)
+
+		doc := &model.CompleteDocument{
+			Meta: &model.MetaData{
+				AuthenticSource: session.IssuerURL,
+			},
+			DocumentData:        claims,
+			DocumentDataVersion: "1.0.0",
+		}
+		docs := map[string]*model.CompleteDocument{
+			session.IssuerURL: doc,
+		}
+
+		if err := c.StoreVCIDocuments(ctx, session.VCISessionID, docs); err != nil {
+			span.SetStatus(codes.Error, "VCI document storage failed")
+			return nil, fmt.Errorf("failed to store VCI documents: %w", err)
+		}
+
+		// Clean up OIDC session
+		service.DeleteSession(ctx, req.State)
+
+		return &OIDCRPCallbackResponse{
+			Status:         "success",
+			CredentialType: session.CredentialType,
+			VCIRedirectURL: "/authorization/consent/#/credentials",
+			Message:        "OIDC authentication successful, continuing VCI flow",
+		}, nil
+	}
+
+	// Standalone mode: create credential directly via issuer gRPC
 	// Marshal claims to JSON for the credential
 	documentData, err := json.Marshal(claims)
 	if err != nil {
@@ -188,7 +229,10 @@ func (c *Client) generateCredentialOfferOIDCRP(ctx context.Context, credentialTy
 	defer span.End()
 
 	// Generate a unique pre-authorized code
-	preAuthCode := fmt.Sprintf("oidcrp_%d", time.Now().UnixNano())
+	preAuthCode, err := crypto.GenerateSecureToken(0, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate pre-auth code: %w", err)
+	}
 
 	// Build credential offer parameters
 	params := openid4vci.CredentialOfferParameters{

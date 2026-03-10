@@ -10,6 +10,7 @@ import (
 	apiv1_issuer "vc/internal/gen/issuer/apiv1_issuer"
 	"vc/pkg/crypto"
 	"vc/pkg/grpchelpers"
+	"vc/pkg/model"
 	"vc/pkg/openid4vci"
 
 	"github.com/gin-gonic/gin"
@@ -184,6 +185,39 @@ func (s *Service) endpointSAMLACS(ctx context.Context, c *gin.Context) (any, err
 		"credential_type", session.CredentialType,
 		"claims_count", len(claims))
 
+	// VCI mode: if the SAML session was initiated from the OpenID4VCI consent flow,
+	// store the transformed claims as a document in the VCI session cache and redirect
+	// back to the consent page, where the standard VCI pipeline will continue.
+	if session.VCISessionID != "" {
+		s.log.Info("SAML ACS: VCI mode detected, storing document in VCI cache",
+			"vci_session_id", session.VCISessionID,
+			"credential_type", session.CredentialType)
+
+		doc := &model.CompleteDocument{
+			Meta: &model.MetaData{
+				AuthenticSource: session.IDPEntityID,
+			},
+			DocumentData:        claims,
+			DocumentDataVersion: "1.0.0",
+		}
+		docs := map[string]*model.CompleteDocument{
+			session.IDPEntityID: doc,
+		}
+
+		if err := s.apiv1.StoreVCIDocuments(ctx, session.VCISessionID, docs); err != nil {
+			span.SetStatus(codes.Error, "VCI document storage failed")
+			return nil, fmt.Errorf("failed to store VCI documents: %w", err)
+		}
+
+		// Clean up SAML session
+		s.samlSPService.DeleteSession(ctx, relayState)
+
+		// Redirect browser back to the consent page to continue the VCI flow
+		c.Redirect(http.StatusFound, "/authorization/consent/#/credentials")
+		return nil, nil
+	}
+
+	// Standalone mode: create credential directly via issuer gRPC
 	// Marshal claims to JSON for the credential
 	documentData, err := json.Marshal(claims)
 	if err != nil {
@@ -202,26 +236,29 @@ func (s *Service) endpointSAMLACS(ctx context.Context, c *gin.Context) (any, err
 	}
 
 	// Create credential using the issuer gRPC API
-	credential, err := s.createCredentialViaSAML(ctx, mapping.CredentialType, documentData, jwk)
+	credential, err := s.createCredentialViaSAML(ctx, session.CredentialType, documentData, jwk)
 	if err != nil {
 		span.SetStatus(codes.Error, "credential creation failed")
 		return nil, fmt.Errorf("failed to create credential: %w", err)
 	}
 
 	// Generate credential offer for wallet
-	credentialOffer, err := s.generateCredentialOffer(ctx, mapping.CredentialType, mapping.CredentialConfigID)
+	credentialOffer, err := s.generateCredentialOffer(ctx, session.CredentialType, mapping.CredentialConfigID)
 	if err != nil {
 		span.SetStatus(codes.Error, "credential offer generation failed")
 		return nil, fmt.Errorf("failed to generate credential offer: %w", err)
 	}
 
+	// Clean up SAML session
+	s.samlSPService.DeleteSession(ctx, relayState)
+
 	s.log.Info("Credential issued successfully",
-		"credential_type", mapping.CredentialType,
+		"credential_type", session.CredentialType,
 		"offer_id", credentialOffer["id"])
 
 	response := map[string]any{
 		"status":           "success",
-		"credential_type":  mapping.CredentialType,
+		"credential_type":  session.CredentialType,
 		"credential":       credential,
 		"credential_offer": credentialOffer,
 		"message":          "SAML authentication and credential issuance successful",
