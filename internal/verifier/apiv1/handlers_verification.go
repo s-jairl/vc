@@ -2,7 +2,10 @@ package apiv1
 
 import (
 	"context"
-	"crypto/x509"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"vc/pkg/cache"
+	"vc/pkg/jose"
 	"vc/pkg/openid4vp"
 	"vc/pkg/sdjwtvc"
 	"vc/pkg/trust"
@@ -62,7 +66,6 @@ type VerificationDirectPostRequest struct {
 }
 
 func (v *VerificationDirectPostRequest) GetKID() (string, error) {
-	fmt.Println("Kid")
 	header := strings.Split(v.Response, ".")[0]
 	b, err := base64.RawStdEncoding.DecodeString(header)
 	if err != nil {
@@ -173,52 +176,99 @@ func (c *Client) VerificationDirectPost(ctx context.Context, req *VerificationDi
 			return nil, fmt.Errorf("invalid response for scope %s: %w", scope, err)
 		}
 
-		// Validate VP Token using VPTokenValidator
-		validator := &openid4vp.VPTokenValidator{
-			Nonce:           authCtx.Nonce,
-			ClientID:        authCtx.ClientID,
-			VerifySignature: true,
-			CheckRevocation: false,
+		// Detect credential format and process accordingly
+		format := detectCredentialFormat(vpToken)
+		c.log.Debug("Detected credential format", "scope", scope, "format", format)
+
+		switch format {
+		case FormatSDJWT:
+			// SD-JWT: Use VPTokenValidator for format validation, then evaluateIssuerTrust for sig+trust
+			validator := &openid4vp.VPTokenValidator{
+				Nonce:           authCtx.Nonce,
+				ClientID:        authCtx.ClientID,
+				VerifySignature: false, // We do real signature verification in evaluateIssuerTrust
+				CheckRevocation: false,
+			}
+
+			if err := validator.Validate(responseParams.VPToken); err != nil {
+				c.log.Error(err, "VP Token validation failed", "scope", scope)
+				return nil, fmt.Errorf("VP Token validation failed for scope %s: %w", scope, err)
+			}
+
+			c.log.Debug("VP Token format validated successfully", "scope", scope)
+
+			// Evaluate trust (includes signature verification) via TrustEvaluator
+			if err := c.evaluateIssuerTrust(ctx, responseParams.VPToken, scope); err != nil {
+				c.log.Error(err, "issuer trust evaluation failed", "scope", scope)
+				return nil, fmt.Errorf("issuer trust evaluation failed for scope %s: %w", scope, err)
+			}
+
+			// Parse SD-JWT credential
+			_, _, _, selectiveDisclosure, _, err := sdjwtvc.Token(responseParams.VPToken).Split()
+			if err != nil {
+				c.log.Error(err, "failed to split sd-jwt", "scope", scope)
+				return nil, err
+			}
+
+			// Parse credential claims
+			parsed, err := sdjwtvc.Token(responseParams.VPToken).Parse()
+			if err != nil {
+				c.log.Error(err, "failed to parse sd-jwt credential", "scope", scope)
+				return nil, err
+			}
+
+			selectiveDisclosureClaims, err := sdjwtvc.ParseSelectiveDisclosure(selectiveDisclosure)
+			if err != nil {
+				c.log.Error(err, "failed to parse selective disclosures", "scope", scope)
+				return nil, err
+			}
+
+			// Add to credential cache array
+			credentialCaches = append(credentialCaches, sdjwtvc.CredentialCache{
+				Credential: parsed.Claims,
+				Claims:     selectiveDisclosureClaims,
+			})
+
+		case FormatMDoc:
+			// mDOC: Use MDocHandler which delegates to TrustEvaluator
+			if c.trustEvaluator == nil {
+				c.log.Error(nil, "TrustEvaluator required for mDOC verification", "scope", scope)
+				return nil, fmt.Errorf("TrustEvaluator not configured for mDOC verification")
+			}
+
+			mdocHandler, err := openid4vp.NewMDocHandler(
+				openid4vp.WithMDocTrustEvaluator(c.trustEvaluator),
+			)
+			if err != nil {
+				c.log.Error(err, "failed to create mDOC handler", "scope", scope)
+				return nil, fmt.Errorf("failed to create mDOC handler for scope %s: %w", scope, err)
+			}
+
+			mdocResult, err := mdocHandler.VerifyAndExtract(ctx, vpToken)
+			if err != nil {
+				c.log.Error(err, "mDOC verification failed", "scope", scope)
+				return nil, fmt.Errorf("mDOC verification failed for scope %s: %w", scope, err)
+			}
+
+			c.log.Debug("mDOC verified successfully", "scope", scope, "doc_count", len(mdocResult.Documents))
+
+			// Convert mDOC claims to credential cache format
+			for docType, docClaims := range mdocResult.Documents {
+				// Convert map claims to []Discloser format
+				disclosers := mapToDisclosers(docClaims.GetClaims())
+				credentialCaches = append(credentialCaches, sdjwtvc.CredentialCache{
+					Credential: map[string]any{
+						"docType":    docType,
+						"namespaces": docClaims.Namespaces,
+					},
+					Claims: disclosers,
+				})
+			}
+
+		default:
+			c.log.Error(nil, "Unknown credential format", "scope", scope, "format", format)
+			return nil, fmt.Errorf("unknown credential format for scope %s", scope)
 		}
-
-		if err := validator.Validate(responseParams.VPToken); err != nil {
-			c.log.Error(err, "VP Token validation failed", "scope", scope)
-			return nil, fmt.Errorf("VP Token validation failed for scope %s: %w", scope, err)
-		}
-
-		c.log.Debug("VP Token validated successfully", "scope", scope)
-
-		// Evaluate trust using AuthZEN PDP if configured
-		if err := c.evaluateIssuerTrust(ctx, responseParams.VPToken, scope); err != nil {
-			c.log.Error(err, "issuer trust evaluation failed", "scope", scope)
-			return nil, fmt.Errorf("issuer trust evaluation failed for scope %s: %w", scope, err)
-		}
-
-		// Parse SD-JWT credential
-		_, _, _, selectiveDisclosure, _, err := sdjwtvc.Token(responseParams.VPToken).Split()
-		if err != nil {
-			c.log.Error(err, "failed to split sd-jwt", "scope", scope)
-			return nil, err
-		}
-
-		// Parse credential claims
-		parsed, err := sdjwtvc.Token(responseParams.VPToken).Parse()
-		if err != nil {
-			c.log.Error(err, "failed to parse sd-jwt credential", "scope", scope)
-			return nil, err
-		}
-
-		selectiveDisclosureClaims, err := sdjwtvc.ParseSelectiveDisclosure(selectiveDisclosure)
-		if err != nil {
-			c.log.Error(err, "failed to parse selective disclosures", "scope", scope)
-			return nil, err
-		}
-
-		// Add to credential cache array
-		credentialCaches = append(credentialCaches, sdjwtvc.CredentialCache{
-			Credential: parsed.Claims,
-			Claims:     selectiveDisclosureClaims,
-		})
 	}
 
 	// Cache validated credentials
@@ -267,69 +317,172 @@ func (c *Client) VerificationCallback(ctx context.Context, req *VerificationCall
 	return reply, nil
 }
 
-// evaluateIssuerTrust evaluates the trust of the credential issuer using the configured TrustEvaluator.
-// For SD-JWT credentials with x5c header, it extracts the certificate chain and evaluates trust
-// against the AuthZEN PDP. If no x5c header is present or no TrustEvaluator is configured,
-// the function succeeds (allow-all mode).
+// jwtKeyMaterial holds key material extracted from a JWT header for signature verification and trust evaluation.
+type jwtKeyMaterial struct {
+	keyType     trust.KeyType
+	keyMaterial any
+	publicKey   crypto.PublicKey
+	issuerID    string // may be updated (e.g., from cert CN fallback)
+}
+
+// extractJWTClaimsInfo extracts the issuer identifier and credential type from JWT claims.
+func extractJWTClaimsInfo(token *jwt.Token) (issuerID, credentialType string) {
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", ""
+	}
+	if iss, ok := claims["iss"].(string); ok {
+		issuerID = iss
+	}
+	if vct, ok := claims["vct"].(string); ok {
+		credentialType = vct
+	}
+	return issuerID, credentialType
+}
+
+// extractJWTKeyMaterial extracts key type, key material, and public key from the JWT header.
+// It supports x5c certificate chains, embedded JWKs, and DID-based key resolution.
+func (c *Client) extractJWTKeyMaterial(ctx context.Context, token *jwt.Token, issuerID, scope, credentialType string) (*jwtKeyMaterial, error) {
+	if x5cRaw, ok := token.Header["x5c"]; ok {
+		certChain, err := jose.ParseX5CHeader(x5cRaw)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse x5c header: %w", err)
+		}
+		effectiveIssuerID := issuerID
+		if issuerID == "" {
+			effectiveIssuerID = certChain[0].Subject.CommonName
+		}
+		c.log.Debug("Verifying credential signature via x5c",
+			"scope", scope, "issuer_id", effectiveIssuerID,
+			"credential_type", credentialType, "cert_chain_length", len(certChain))
+		return &jwtKeyMaterial{
+			keyType: trust.KeyTypeX5C, keyMaterial: certChain,
+			publicKey: certChain[0].PublicKey, issuerID: effectiveIssuerID,
+		}, nil
+	}
+
+	if jwkRaw, ok := token.Header["jwk"]; ok {
+		jwkMap, ok := jwkRaw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid jwk header format: expected map, got %T", jwkRaw)
+		}
+		publicKey, err := jose.ParseJWKToPublicKey(jwkMap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse jwk header: %w", err)
+		}
+		c.log.Debug("Verifying credential signature via jwk",
+			"scope", scope, "issuer_id", issuerID, "credential_type", credentialType)
+		return &jwtKeyMaterial{
+			keyType: trust.KeyTypeJWK, keyMaterial: jwkMap,
+			publicKey: publicKey, issuerID: issuerID,
+		}, nil
+	}
+
+	if strings.HasPrefix(issuerID, "did:") {
+		resolver, ok := c.trustEvaluator.(trust.KeyResolver)
+		if !ok {
+			c.log.Warn("Issuer is DID but trust evaluator does not support key resolution",
+				"scope", scope, "issuer_id", issuerID)
+			return nil, fmt.Errorf("cannot resolve DID issuer key: trust evaluator does not support key resolution")
+		}
+		c.log.Debug("Resolving issuer key via DID",
+			"scope", scope, "issuer_id", issuerID, "credential_type", credentialType)
+		resolvedKey, err := resolver.ResolveKey(ctx, issuerID)
+		if err != nil {
+			c.log.Warn("Failed to resolve DID issuer key",
+				"scope", scope, "issuer_id", issuerID, "error", err)
+			return nil, fmt.Errorf("failed to resolve DID issuer key: %w", err)
+		}
+		c.log.Debug("Verifying credential signature via resolved DID key",
+			"scope", scope, "issuer_id", issuerID, "credential_type", credentialType)
+		return &jwtKeyMaterial{
+			keyType: trust.KeyTypeJWK, keyMaterial: resolvedKey,
+			publicKey: resolvedKey, issuerID: issuerID,
+		}, nil
+	}
+
+	c.log.Warn("Credential missing x5c or jwk header and issuer is not a DID - cannot evaluate issuer trust",
+		"scope", scope, "issuer_id", issuerID)
+	return nil, fmt.Errorf("credential missing x5c or jwk header and issuer is not a DID")
+}
+
+// evaluateIssuerTrust verifies the credential signature and evaluates the trust of the credential issuer.
+// For SD-JWT credentials with x5c header, it extracts the certificate chain, verifies the signature,
+// and evaluates trust against the AuthZEN PDP. For credentials with jwk header, it uses the embedded JWK.
+// If neither x5c nor jwk header is present but the issuer is a DID, it attempts to resolve
+// the key via go-trust's DID resolution. Signature verification happens as part of jwt.Parse.
 func (c *Client) evaluateIssuerTrust(ctx context.Context, vpToken string, scope string) error {
+	if c.trustEvaluator == nil {
+		c.log.Error(nil, "Trust evaluator not initialized - this should never happen")
+		return fmt.Errorf("trust evaluator not initialized")
+	}
+
 	// Split the SD-JWT to get the issuer JWT
 	parts := strings.Split(vpToken, "~")
-	if len(parts) < 1 {
-		return nil // No JWT to evaluate
-	}
-
 	issuerJWT := parts[0]
+	if issuerJWT == "" {
+		return fmt.Errorf("empty issuer JWT in VP token")
+	}
 
-	// Parse JWT header to check for x5c
+	// Build the algorithm allowlist for signature verification
+	allowedAlgs := c.cfg.Verifier.Trust.AllowedSignatureAlgorithms
+	allowedSet := buildAllowedAlgorithmSet(allowedAlgs)
+
+	// keyInfo is captured by the keyfunc closure and populated during jwt.Parse.
+	// The keyfunc inspects the JWT header (x5c/jwk) and claims (iss for DID resolution)
+	// to determine which public key to use for signature verification.
+	var keyInfo *jwtKeyMaterial
+
 	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, err := parser.ParseUnverified(issuerJWT, jwt.MapClaims{})
+	token, err := parser.Parse(issuerJWT, func(token *jwt.Token) (any, error) {
+		alg := token.Method.Alg()
+
+		// Check algorithm allowlist - "none" is never permitted
+		if !allowedSet[alg] {
+			return nil, fmt.Errorf("algorithm %q is not in the allowed list", alg)
+		}
+
+		// Extract issuer and credential type from claims (available in keyfunc)
+		issuerID, credentialType := extractJWTClaimsInfo(token)
+
+		// Extract key material from header (x5c, jwk, or DID resolution)
+		ki, err := c.extractJWTKeyMaterial(ctx, token, issuerID, scope, credentialType)
+		if err != nil {
+			return nil, err
+		}
+		keyInfo = ki
+
+		// Validate the signing method matches the key type
+		if err := validateSigningMethodForKey(token, ki.publicKey); err != nil {
+			return nil, err
+		}
+
+		return ki.publicKey, nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to parse JWT header: %w", err)
+		c.log.Warn("JWT signature verification failed",
+			"scope", scope, "error", err)
+		return fmt.Errorf("JWT signature verification failed: %w", err)
 	}
 
-	// Check for x5c header
-	x5cRaw, ok := token.Header["x5c"]
-	if !ok {
-		// No x5c header - trust evaluation not applicable for this credential format
-		c.log.Debug("No x5c header in credential, skipping trust evaluation", "scope", scope)
-		return nil
-	}
-
-	// Parse x5c certificate chain
-	certChain, err := parseX5CHeader(x5cRaw)
-	if err != nil {
-		return fmt.Errorf("failed to parse x5c header: %w", err)
-	}
-
-	// Extract issuer identifier and credential type from claims
-	issuerID := ""
+	// At this point the JWT signature is verified. Extract claims for trust evaluation.
+	issuerID := keyInfo.issuerID
 	credentialType := ""
 	if claims, ok := token.Claims.(jwt.MapClaims); ok {
-		if iss, ok := claims["iss"].(string); ok {
-			issuerID = iss
-		}
 		if vct, ok := claims["vct"].(string); ok {
 			credentialType = vct
 		}
 	}
 
-	// Fallback to leaf certificate CN for issuer ID
-	if issuerID == "" && len(certChain) > 0 {
-		issuerID = certChain[0].Subject.CommonName
-	}
-
-	c.log.Debug("Evaluating issuer trust",
-		"scope", scope,
-		"issuer_id", issuerID,
-		"credential_type", credentialType,
-		"cert_chain_length", len(certChain))
+	c.log.Debug("JWT signature verified successfully",
+		"scope", scope, "issuer_id", issuerID)
 
 	// Evaluate trust via AuthZEN PDP
 	decision, err := c.trustEvaluator.Evaluate(ctx, &trust.EvaluationRequest{
 		EvaluationRequest: trustapi.EvaluationRequest{
 			SubjectID:      issuerID,
-			KeyType:        trust.KeyTypeX5C,
-			Key:            certChain,
+			KeyType:        keyInfo.keyType,
+			Key:            keyInfo.keyMaterial,
 			Role:           trust.RoleCredentialIssuer,
 			CredentialType: credentialType,
 		},
@@ -340,54 +493,127 @@ func (c *Client) evaluateIssuerTrust(ctx context.Context, vpToken string, scope 
 
 	if !decision.Trusted {
 		c.log.Warn("Issuer not trusted",
-			"scope", scope,
-			"issuer_id", issuerID,
-			"reason", decision.Reason,
+			"scope", scope, "issuer_id", issuerID,
+			"key_type", keyInfo.keyType, "reason", decision.Reason,
 			"trust_framework", decision.TrustFramework)
 		return fmt.Errorf("issuer not trusted: %s", decision.Reason)
 	}
 
 	c.log.Info("Issuer trust verified",
-		"scope", scope,
-		"issuer_id", issuerID,
-		"trust_framework", decision.TrustFramework)
+		"scope", scope, "issuer_id", issuerID,
+		"key_type", keyInfo.keyType, "trust_framework", decision.TrustFramework)
 
 	return nil
 }
 
-// parseX5CHeader parses the x5c header into a certificate chain.
-// The x5c header is an array of base64-encoded DER certificates.
-func parseX5CHeader(x5cRaw any) ([]*x509.Certificate, error) {
-	x5cArray, ok := x5cRaw.([]any)
-	if !ok {
-		return nil, fmt.Errorf("x5c header must be an array")
+// defaultAllowedAlgorithms is the secure default set of allowed JWT signature algorithms.
+// These are all considered cryptographically strong as of 2024.
+var defaultAllowedAlgorithms = []string{
+	"ES256", "ES384", "ES512", // ECDSA
+	"RS256", "RS384", "RS512", // RSA PKCS#1 v1.5
+	"PS256", "PS384", "PS512", // RSA-PSS
+	"EdDSA", // Ed25519
+}
+
+// buildAllowedAlgorithmSet creates a set of allowed algorithms for O(1) lookup.
+// The "none" algorithm is NEVER allowed regardless of configuration.
+func buildAllowedAlgorithmSet(allowedAlgorithms []string) map[string]bool {
+	if len(allowedAlgorithms) == 0 {
+		allowedAlgorithms = defaultAllowedAlgorithms
+	}
+	allowedSet := make(map[string]bool, len(allowedAlgorithms))
+	for _, alg := range allowedAlgorithms {
+		allowedSet[alg] = true
+	}
+	// SECURITY: "none" algorithm is NEVER allowed, even if misconfigured
+	delete(allowedSet, "none")
+	delete(allowedSet, "None")
+	delete(allowedSet, "NONE")
+	return allowedSet
+}
+
+// validateSigningMethodForKey checks that the JWT signing method is compatible with the provided public key type.
+func validateSigningMethodForKey(token *jwt.Token, publicKey crypto.PublicKey) error {
+	alg := token.Method.Alg()
+	switch publicKey.(type) {
+	case *ecdsa.PublicKey:
+		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {
+			return fmt.Errorf("unexpected signing method %v for ECDSA key", alg)
+		}
+	case *rsa.PublicKey:
+		_, isRS := token.Method.(*jwt.SigningMethodRSA)
+		_, isPS := token.Method.(*jwt.SigningMethodRSAPSS)
+		if !isRS && !isPS {
+			return fmt.Errorf("unexpected signing method %v for RSA key", alg)
+		}
+	case ed25519.PublicKey:
+		if _, ok := token.Method.(*jwt.SigningMethodEd25519); !ok {
+			return fmt.Errorf("unexpected signing method %v for Ed25519 key", alg)
+		}
+	default:
+		return fmt.Errorf("unsupported public key type: %T", publicKey)
+	}
+	return nil
+}
+
+// CredentialFormat represents the format of a verifiable credential.
+type CredentialFormat string
+
+const (
+	// FormatSDJWT represents SD-JWT Verifiable Credentials (vc+sd-jwt, dc+sd-jwt)
+	FormatSDJWT CredentialFormat = "vc+sd-jwt"
+	// FormatMDoc represents ISO/IEC 18013-5 mDOC credentials (mso_mdoc)
+	FormatMDoc CredentialFormat = "mso_mdoc"
+	// FormatUnknown represents an unrecognized format
+	FormatUnknown CredentialFormat = "unknown"
+)
+
+// detectCredentialFormat determines the credential format from the VP token.
+// SD-JWT: contains ~ separators (disclosure markers) and JWT dots
+// mDOC: base64url-encoded CBOR (doesn't look like JWT - no dots, or random data without ~)
+func detectCredentialFormat(vpToken string) CredentialFormat {
+	// SD-JWT format: <issuer-jwt>~<disclosure1>~<disclosure2>~...[~<kb-jwt>]
+	// Must contain at least one ~ and the first part must look like a JWT (has 2 dots)
+	if strings.Contains(vpToken, "~") {
+		parts := strings.Split(vpToken, "~")
+		if len(parts) > 0 && strings.Count(parts[0], ".") == 2 {
+			return FormatSDJWT
+		}
 	}
 
-	if len(x5cArray) == 0 {
-		return nil, fmt.Errorf("x5c header is empty")
+	// Plain JWT without SD (still vc+sd-jwt format per spec, but no disclosures)
+	if strings.Count(vpToken, ".") == 2 && !strings.Contains(vpToken, "~") {
+		// Could be a plain JWT - check if it's valid base64url
+		headerPart := strings.Split(vpToken, ".")[0]
+		if _, err := base64.RawURLEncoding.DecodeString(headerPart); err == nil {
+			return FormatSDJWT
+		}
 	}
 
-	certs := make([]*x509.Certificate, 0, len(x5cArray))
-	for i, certRaw := range x5cArray {
-		certB64, ok := certRaw.(string)
-		if !ok {
-			return nil, fmt.Errorf("x5c[%d] is not a string", i)
+	// mDOC: base64url-encoded CBOR DeviceResponse
+	// Try to decode as base64url - if successful and doesn't look like JWT, assume mDOC
+	if !strings.Contains(vpToken, ".") && !strings.Contains(vpToken, "~") {
+		if _, err := base64.RawURLEncoding.DecodeString(vpToken); err == nil {
+			return FormatMDoc
 		}
-
-		// Decode base64
-		certDER, err := base64.StdEncoding.DecodeString(certB64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode x5c[%d]: %w", i, err)
+		// Also try standard base64 (some implementations use this)
+		if _, err := base64.StdEncoding.DecodeString(vpToken); err == nil {
+			return FormatMDoc
 		}
-
-		// Parse certificate
-		cert, err := x509.ParseCertificate(certDER)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse x5c[%d]: %w", i, err)
-		}
-
-		certs = append(certs, cert)
 	}
 
-	return certs, nil
+	return FormatUnknown
+}
+
+// mapToDisclosers converts a map of claims to []sdjwtvc.Discloser format.
+// This is used for mDOC credentials where claims are extracted as a map.
+func mapToDisclosers(claims map[string]any) []sdjwtvc.Discloser {
+	disclosers := make([]sdjwtvc.Discloser, 0, len(claims))
+	for name, value := range claims {
+		disclosers = append(disclosers, sdjwtvc.Discloser{
+			ClaimName: name,
+			Value:     value,
+		})
+	}
+	return disclosers
 }
