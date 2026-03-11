@@ -2,7 +2,6 @@ package httpserver
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -128,17 +127,11 @@ func (s *Service) endpointSAMLACS(ctx context.Context, c *gin.Context) (any, err
 		return nil, fmt.Errorf("SAMLResponse parameter is required")
 	}
 
-	// Decode base64
-	samlResponseXML, err := base64.StdEncoding.DecodeString(samlResponseB64)
-	if err != nil {
-		span.SetStatus(codes.Error, "invalid base64")
-		return nil, fmt.Errorf("failed to decode SAMLResponse: %w", err)
-	}
-
 	relayState := c.PostForm("RelayState")
 
-	// Process the SAML assertion
-	assertion, err := s.samlSPService.ProcessAssertion(ctx, string(samlResponseXML), relayState)
+	// Pass the base64-encoded SAMLResponse directly to ProcessAssertion.
+	// The crewjam/saml library handles base64 decoding internally.
+	assertion, err := s.samlSPService.ProcessAssertion(ctx, samlResponseB64, relayState)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
@@ -222,10 +215,6 @@ func (s *Service) endpointSAMLACS(ctx context.Context, c *gin.Context) (any, err
 		// Clean up SAML session (clear err so defer doesn't double-delete)
 		err = nil
 		s.samlSPService.DeleteSession(ctx, relayState)
-
-		// Clean up auth cookies before redirect
-		c.SetCookie("auth_method", "", -1, "/authorization/consent", "", false, false)
-		c.SetCookie("saml_redirect_url", "", -1, "/authorization/consent", "", false, false)
 
 		// Redirect browser back to the consent page to continue the VCI flow
 		c.Redirect(http.StatusFound, "/authorization/consent/#/credentials")

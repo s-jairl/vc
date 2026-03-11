@@ -83,6 +83,17 @@ func New(ctx context.Context, cfg *model.SAMLConfig, sessionCache pkgcache.Cache
 		SignatureMethod:   "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
 	}
 
+	// Load optional metadata signing certificate for signature verification
+	var metadataSigningCert *x509.Certificate
+	if cfg.MetadataSigningCertPath != "" {
+		metadataSigningCert, err = LoadMetadataSigningCert(cfg.MetadataSigningCertPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load metadata signing certificate: %w", err)
+		}
+		s.log.Info("metadata signature verification enabled",
+			"cert_path", cfg.MetadataSigningCertPath)
+	}
+
 	// Initialize MDQ client (either MDQ or static mode)
 	if cfg.StaticIDPMetadata != nil {
 		// Static IdP mode
@@ -96,6 +107,7 @@ func New(ctx context.Context, cfg *model.SAMLConfig, sessionCache pkgcache.Cache
 			metadataSource,
 			cfg.StaticIDPMetadata.EntityID,
 			isURL,
+			metadataSigningCert,
 			s.log,
 		)
 		if err != nil {
@@ -107,7 +119,7 @@ func New(ctx context.Context, cfg *model.SAMLConfig, sessionCache pkgcache.Cache
 			"idp_entity_id", cfg.StaticIDPMetadata.EntityID)
 	} else {
 		// MDQ mode
-		s.mdqClient = NewMDQClient(cfg.MDQServer, cfg.MetadataCacheTTL, s.log)
+		s.mdqClient = NewMDQClient(cfg.MDQServer, cfg.MetadataCacheTTL, metadataSigningCert, s.log)
 		s.log.Info("SAML service initialized with MDQ",
 			"entity_id", cfg.EntityID,
 			"mdq_server", cfg.MDQServer)
@@ -252,12 +264,14 @@ func (s *Service) ProcessAssertion(ctx context.Context, samlResponseEncoded stri
 		return nil, fmt.Errorf("failed to get IdP metadata: %w", err)
 	}
 
-	// Set IdP metadata on SP for validation
-	s.sp.IDPMetadata = idpMetadata
+	// Create a per-request copy of the SP to avoid race conditions on
+	// IDPMetadata when processing concurrent SAML responses from different IdPs.
+	sp := *s.sp
+	sp.IDPMetadata = idpMetadata
 
 	// Parse and validate SAML response
-	acsURL := s.sp.AcsURL
-	samlResp, err := s.sp.ParseResponse(&http.Request{
+	acsURL := sp.AcsURL
+	samlResp, err := sp.ParseResponse(&http.Request{
 		URL: &acsURL,
 		PostForm: url.Values{
 			"SAMLResponse": {samlResponseEncoded},
@@ -280,21 +294,14 @@ func (s *Service) ProcessAssertion(ctx context.Context, samlResponseEncoded stri
 		}
 	}
 
-	// Validate assertion subject and conditions are present
+	// Validate assertion subject and conditions are present.
+	// Time conditions (NotBefore/NotOnOrAfter) are already validated by
+	// crewjam/saml's validateAssertion(), so we don't duplicate that here.
 	if samlResp.Subject == nil || samlResp.Subject.NameID == nil {
 		return nil, fmt.Errorf("SAML assertion missing Subject or NameID")
 	}
 	if samlResp.Conditions == nil {
 		return nil, fmt.Errorf("SAML assertion missing Conditions")
-	}
-
-	// Validate assertion time conditions (SAML 2.0 §2.5.1)
-	now := time.Now()
-	if !samlResp.Conditions.NotBefore.IsZero() && now.Before(samlResp.Conditions.NotBefore) {
-		return nil, fmt.Errorf("SAML assertion not yet valid: now=%s, NotBefore=%s", now, samlResp.Conditions.NotBefore)
-	}
-	if !samlResp.Conditions.NotOnOrAfter.IsZero() && now.After(samlResp.Conditions.NotOnOrAfter) {
-		return nil, fmt.Errorf("SAML assertion expired: now=%s, NotOnOrAfter=%s", now, samlResp.Conditions.NotOnOrAfter)
 	}
 
 	return &Assertion{
