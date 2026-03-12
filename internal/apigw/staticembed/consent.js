@@ -86,7 +86,7 @@ Alpine.data("app", () => ({
     /** @type {boolean} */
     loggedIn: false,
 
-    /** @type {"basic" | "pid_auth" | "saml" | "oidc" | null} */
+    /** @type {"basic" | "saml" | "oidc" | "openid4vp" | null} */
     authMethod: null,
 
     /** @type {number | null} */
@@ -132,7 +132,13 @@ Alpine.data("app", () => ({
         const authMethod = this.$el.dataset.authMethod || null;
         const validMethods = ["basic", "pid_auth", "saml", "oidc"];
 
-        if (!authMethod || !validMethods.includes(authMethod)) {
+        if (
+            !authMethod ||
+            authMethod !== "basic" &&
+            authMethod !== "saml" &&
+            authMethod !== "oidc" &&
+            authMethod !== "openid4vp"
+        ) {
             this.error = `Unknown auth method: '${authMethod}'`;
             return;
         }
@@ -245,7 +251,7 @@ Alpine.data("app", () => ({
     handleLoginPidAuth(immediate = false) {
         const rawRedirectUrl = this.$el.dataset.redirectUrl || null;
         if (!rawRedirectUrl) {
-            this.error = "Missing PID auth redirect URL";
+            this.error = "Missing OpenID4VP redirect URL";
             return;
         }
 
@@ -347,6 +353,7 @@ Alpine.data("app", () => ({
     handleCredentialSelection(event) {
         if (!this.redirectUrl) {
             this.error = "'redirect_url' is null";
+            return;
         }
         this.redirect(this.redirectUrl);
     },
@@ -370,7 +377,6 @@ Alpine.data("app", () => ({
         }
 
         const data = await response.json();
-        console.info(JSON.stringify(data, null, 2));
         return data;
     },
 

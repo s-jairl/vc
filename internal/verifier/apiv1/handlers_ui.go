@@ -32,10 +32,10 @@ func (c *Client) UIMetadata(ctx context.Context) (*UIMetadataReply, error) {
 
 	for scope, constructor := range c.cfg.Common.CredentialConstructor {
 		info := &UICredentialInfo{
-			Attributes: constructor.Attributes,
+			Attributes: constructor.GetAttributes(),
 		}
-		if constructor.VCTM != nil {
-			info.VCT = constructor.VCTM.VCT
+		if vctm := constructor.GetVCTM(); vctm != nil {
+			info.VCT = vctm.VCT
 		}
 		reply.Credentials[scope] = info
 	}
@@ -76,19 +76,19 @@ func (c *Client) UIInteraction(ctx context.Context, req *UIInteractionRequest) (
 	}
 
 	authorizationContext := &cache.AuthorizationContext{
-		SessionID:                sessionID,
-		Scopes:                   scopes,
-		Code:                     "",
-		RequestURI:               "",
-		WalletURI:                "",
-		Forfeited:                false,
-		State:                    state,
-		ClientID:                 fmt.Sprintf("x509_san_dns:%s", strings.TrimLeft(c.cfg.Verifier.PublicURL, "https://")),
-		ExpiresAt:                0,
-		CodeChallenge:            "",
-		CodeChallengeMethod:      "",
-		Consent:                  false,
-		AuthenticSource:          "",
+		SessionID:           sessionID,
+		Scopes:              scopes,
+		Code:                "",
+		RequestURI:          "",
+		WalletURI:           "",
+		Forfeited:           false,
+		State:               state,
+		ClientID:            fmt.Sprintf("x509_san_dns:%s", strings.TrimLeft(c.cfg.Verifier.PublicURL, "https://")),
+		ExpiresAt:           0,
+		CodeChallenge:       "",
+		CodeChallengeMethod: "",
+		Consent:             false,
+		AuthenticSource:     "",
 		// Identity and Token are nil until wallet presents credentials
 		Nonce:                    nonce,
 		EphemeralEncryptionKeyID: uuid.NewString(),
