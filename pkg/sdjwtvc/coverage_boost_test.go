@@ -22,6 +22,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 
 	mockName := "name"
 	vctm := &VCTM{
+		VCT:    "https://example.com/credential/test",
 		Claims: []Claim{
 			{
 				Path: []*string{&mockName},
@@ -36,7 +37,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 		"crv": "P-256",
 	}
 
-	vctURL, integrity := serveVCTM(t, vctm)
+	vctmRaw, integrity := marshalVCTM(t, vctm)
 	signer := newTestSigner(privateKey, "key-1")
 
 	t.Run("nil_options_uses_defaults", func(t *testing.T) {
@@ -44,7 +45,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 		token, err := client.BuildCredentialWithSigner(
 			t.Context(),
 			"https://issuer.example.com",
-			signer, vctURL, documentData, holderJWK,
+			signer, vctmRaw, documentData, holderJWK,
 			&CredentialOptions{Integrity: integrity},
 		)
 		if err != nil {
@@ -60,7 +61,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 		token, err := client.BuildCredentialWithSigner(
 			t.Context(),
 			"https://issuer.example.com",
-			signer, vctURL, documentData, holderJWK,
+			signer, vctmRaw, documentData, holderJWK,
 			&CredentialOptions{
 				DecoyDigests:   0,
 				ExpirationDays: 0, // Should default to 365
@@ -80,7 +81,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 		token, err := client.BuildCredentialWithSigner(
 			t.Context(),
 			"https://issuer.example.com",
-			signer, vctURL, documentData, holderJWK,
+			signer, vctmRaw, documentData, holderJWK,
 			&CredentialOptions{
 				DecoyDigests:   2,
 				ExpirationDays: 90,
@@ -101,7 +102,7 @@ func TestBuildCredentialWithOptions_DefaultOptions(t *testing.T) {
 		_, err := client.BuildCredentialWithSigner(
 			t.Context(),
 			"https://issuer.example.com",
-			signer, vctURL, invalidData, holderJWK,
+			signer, vctmRaw, invalidData, holderJWK,
 			&CredentialOptions{Integrity: integrity},
 		)
 		if err == nil {
