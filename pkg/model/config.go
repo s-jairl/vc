@@ -957,7 +957,7 @@ type CredentialConstructor struct {
 	AuthScopes []string `yaml:"auth_scopes,omitempty" json:"auth_scopes,omitempty"`
 	// AuthClaims lists identity claims to extract from the authentication credential.
 	// Required when AuthMethod is "openid4vp".
-	AuthClaims []string `yaml:"auth_claims,omitempty" json:"auth_claims,omitempty"`
+	AuthClaims []string                       `yaml:"auth_claims,omitempty" json:"auth_claims,omitempty"`
 	Attributes map[string]map[string][]string `yaml:"attributes" json:"attributes_v2" validate:"omitempty,dive,required"`
 
 	// VCTMRaw holds the raw JSON bytes of the VCTM document for serving
@@ -1078,12 +1078,11 @@ func (c *CredentialConstructor) IsLocalVCTM() bool {
 }
 
 // ResolveVCTUrls computes the URL-based VCT for each credential constructor
-// and stores it in VCTURL.  VCTM.VCT is left unchanged (it keeps
-// the original URN from the VCTM file).
+// and stores it in VCTURL.  VCTM.VCT, VCTMRaw, and Integrity are left
+// unchanged — the served VCTM document preserves the original VCT
+// identifier from the VCTM file (e.g. a URN).
 // For local VCTMs the URL is built from apigwPublicURL + /type-metadata/{scope}.
 // For external VCTMs the VCTMUrl is used.
-// VCTMRaw and Integrity are re-computed with the URL-based VCT so the
-// served document and SRI hash stay consistent.
 func (cfg *Cfg) ResolveVCTUrls(apigwPublicURL string) error {
 	if cfg.Common == nil {
 		return nil
@@ -1105,28 +1104,8 @@ func (cfg *Cfg) ResolveVCTUrls(apigwPublicURL string) error {
 			vctURL = constructor.VCTMUrl
 		}
 
-		// Build a patched copy of the VCTM with the URL-based VCT for
-		// serialization, but leave the in-memory VCTM.VCT untouched.
 		constructor.mu.Lock()
 		constructor.VCTURL = vctURL
-
-		vctmCopy := *constructor.VCTM
-		vctmCopy.VCT = vctURL
-
-		// Re-serialize and re-hash so served document and integrity match.
-		rawBytes, err := json.Marshal(&vctmCopy)
-		if err != nil {
-			constructor.mu.Unlock()
-			return fmt.Errorf("failed to re-serialize VCTM for scope %s: %w", scope, err)
-		}
-		if constructor.IsLocalVCTM() {
-			constructor.VCTMRaw = rawBytes
-		}
-		constructor.Integrity, err = vctmCopy.SRIIntegrity(rawBytes)
-		if err != nil {
-			constructor.mu.Unlock()
-			return fmt.Errorf("failed to re-compute integrity for scope %s: %w", scope, err)
-		}
 		constructor.mu.Unlock()
 	}
 
@@ -1197,21 +1176,22 @@ func (cfg *IssuerMetadata) Generate(ctx context.Context, publicURL string, crede
 
 				// Map rendering information from VCTM to OpenID4VCI format
 				if vctmDisplay.Rendering != nil {
-					if vctmDisplay.Rendering.Simple.BackgroundColor != "" {
-						display.BackgroundColor = vctmDisplay.Rendering.Simple.BackgroundColor
+					simple := vctmDisplay.Rendering.Simple
+					if simple.BackgroundColor != "" {
+						display.BackgroundColor = simple.BackgroundColor
 					}
-					if vctmDisplay.Rendering.Simple.TextColor != "" {
-						display.TextColor = vctmDisplay.Rendering.Simple.TextColor
+					if simple.TextColor != "" {
+						display.TextColor = simple.TextColor
 					}
-					if vctmDisplay.Rendering.Simple.Logo.URI != "" {
+					if simple.Logo.URI != "" {
 						display.Logo = openid4vci.MetadataLogo{
-							URI:     vctmDisplay.Rendering.Simple.Logo.URI,
-							AltText: vctmDisplay.Rendering.Simple.Logo.AltText,
+							URI:     simple.Logo.URI,
+							AltText: simple.Logo.AltText,
 						}
 					}
-					if vctmDisplay.Rendering.Simple.BackgroundImage != nil && vctmDisplay.Rendering.Simple.BackgroundImage.URI != "" {
+					if simple.BackgroundImage != nil && simple.BackgroundImage.URI != "" {
 						display.BackgroundImage = openid4vci.MetadataBackgroundImage{
-							URI: vctmDisplay.Rendering.Simple.BackgroundImage.URI,
+							URI: simple.BackgroundImage.URI,
 						}
 					}
 				}
